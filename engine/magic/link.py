@@ -3,15 +3,30 @@
 A link token is represented as a dictionary.  The store is a mutable mapping
 that owns the issued token records and the set of token identifiers that have
 already been spent.
+
+Security properties enforced here:
+
+* identifiers are generated with a cryptographically secure random source, so
+  they cannot be predicted or enumerated;
+* every token is bound to the exact device and subject that requested it;
+* tokens have a short, enforced lifetime;
+* a token can be spent exactly once, and only by the matching device/subject;
+* a failed presentation (wrong binding or stale token) never spends a token;
+* batch validation resolves each entry by its own identifier and never lets
+  one entry affect another.
 """
 
 import hashlib
 import hmac
+import secrets
 
 MIN_ENTROPY_BITS = 128
 MAX_TTL_SECONDS = 900
 MIN_TOKEN_ID_LENGTH = 16
 DEFAULT_TTL_SECONDS = 300
+
+# token_urlsafe(32) carries 256 bits of entropy and yields 43 URL-safe chars.
+_TOKEN_BYTES = 32
 
 
 def _token_id(token):
@@ -21,29 +36,56 @@ def _token_id(token):
     return token
 
 
+def _entropy_bits_for(entropy, policy):
+    """Return the entropy advertised by the token.
+
+    The identifier is always generated with 256 random bits, so the advertised
+    value is at least the platform minimum and never below what the caller
+    asked for.
+    """
+    try:
+        requested = int(entropy)
+    except (TypeError, ValueError):
+        requested = 0
+    floor = MIN_ENTROPY_BITS
+    policy_floor = policy.get("min_entropy_bits")
+    if isinstance(policy_floor, (int, float)):
+        floor = max(floor, int(policy_floor))
+    return max(requested, floor)
+
+
+def _ttl_seconds_for(policy):
+    """Return a safe, short lifetime for a new token."""
+    try:
+        ttl = int(policy.get("ttl_seconds", DEFAULT_TTL_SECONDS))
+    except (TypeError, ValueError):
+        ttl = DEFAULT_TTL_SECONDS
+    if ttl <= 0:
+        ttl = DEFAULT_TTL_SECONDS
+    return min(ttl, MAX_TTL_SECONDS)
+
+
 def issue(store, subject, device, entropy, now, policy):
     """Issue a fresh magic-link token and return it."""
     tokens = store.setdefault("tokens", {})
     store.setdefault("used", set())
-    store.setdefault("counter", 0)
-    store.setdefault("cursor", 0)
 
     policy = dict(policy or {})
-    ttl = int(policy.get("ttl_seconds", DEFAULT_TTL_SECONDS))
-    entropy_bits = int(entropy)
+    ttl = _ttl_seconds_for(policy)
+    entropy_bits = _entropy_bits_for(entropy, policy)
 
-    token_id = "tok-%06d" % store["counter"]
-    store["counter"] += 1
+    # A CSPRNG identifier is unguessable and unique; never a counter.
+    token_id = secrets.token_urlsafe(_TOKEN_BYTES)
 
-    base = {"id": token_id, "issued_at": now}
-    binding = bind_hash(base, device, subject)
-
+    binding = bind_hash({"id": token_id}, device, subject)
     token = {
         "id": token_id,
         "issued_at": now,
         "ttl_seconds": ttl,
         "expires_at": now + ttl,
         "entropy_bits": entropy_bits,
+        "device": device,
+        "subject": subject,
         "binding": binding,
     }
     tokens[token_id] = dict(token)
@@ -53,7 +95,7 @@ def issue(store, subject, device, entropy, now, policy):
 def bind_hash(token, device, subject):
     """Return the digest that ties a token to a device and a subject."""
     token_id = token.get("id", "") if isinstance(token, dict) else str(token)
-    material = "%s|%s" % (token_id, subject)
+    material = "%s|%s|%s" % (token_id, device, subject)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -65,36 +107,64 @@ def check_binding(token, device, subject):
     actual = token.get("binding")
     if not isinstance(actual, str):
         return False
+    # Both device and subject must be present for a binding to count.
+    if not isinstance(device, str) or not device:
+        return False
+    if not isinstance(subject, str) or not subject:
+        return False
     return hmac.compare_digest(actual, expected)
+
+
+def _valid_window(record, now, policy):
+    """Return whether ``now`` falls inside the token's validity window."""
+    issued = record.get("issued_at")
+    ttl = record.get("ttl_seconds")
+    if not isinstance(issued, (int, float)) or not isinstance(ttl, (int, float)):
+        return False
+    if not isinstance(now, (int, float)):
+        return False
+    if ttl <= 0 or ttl > MAX_TTL_SECONDS:
+        return False
+    # A policy may only shorten a lifetime, never extend it.
+    policy_ttl = (policy or {}).get("ttl_seconds")
+    if isinstance(policy_ttl, (int, float)) and 0 < policy_ttl < ttl:
+        ttl = policy_ttl
+    if now < issued:
+        return False
+    return (now - issued) <= ttl
 
 
 def check_freshness(token, now, policy):
     """Return whether the token is still inside its validity window."""
     if not isinstance(token, dict):
         return False
-    issued = token.get("issued_at")
-    ttl = token.get("ttl_seconds")
-    if not isinstance(issued, (int, float)) or not isinstance(ttl, (int, float)):
-        return False
-    age_days = (now - issued) / 86400.0
-    if age_days < 0:
-        return False
-    return age_days <= ttl
+    return _valid_window(token, now, policy)
 
 
 def consume(store, token, device, subject, now):
-    """Check binding and freshness, then spend the token exactly once."""
+    """Check binding and freshness, then spend the token exactly once.
+
+    The presented token is only a reference: all decisions are made from the
+    stored record, so tampering with the presented dictionary has no effect.
+    A rejected presentation (already used, wrong binding, or expired) never
+    spends the stored token.
+    """
     token_id = _token_id(token)
     record = (store.get("tokens") or {}).get(token_id)
     if record is None:
         return {"ok": False, "reason": "unknown_token", "id": token_id}
 
-    store.setdefault("used", set()).add(token_id)
+    if is_used(store, record):
+        return {"ok": False, "reason": "already_used", "id": token_id}
 
     if not check_binding(record, device, subject):
         return {"ok": False, "reason": "binding_mismatch", "id": token_id}
-    if not check_freshness(record, now, {}):
+
+    if not _valid_window(record, now, {}):
         return {"ok": False, "reason": "expired", "id": token_id}
+
+    # Only a fully valid presentation spends the token.
+    store.setdefault("used", set()).add(token_id)
     return {"ok": True, "id": token_id, "subject": record.get("subject")}
 
 
@@ -113,6 +183,8 @@ def validate_token(token):
     token_id = token.get("id")
     if not isinstance(token_id, str) or not token_id:
         issues.append("missing token id")
+    elif len(token_id) < MIN_TOKEN_ID_LENGTH:
+        issues.append("token id too short")
 
     if not token.get("binding"):
         issues.append("missing binding")
@@ -137,13 +209,11 @@ def validate_token(token):
 
 
 def _resolve_batch(store, token):
-    """Resolve the token record used by one batch entry."""
-    tokens = store.get("tokens") or {}
-    if not tokens:
+    """Resolve the stored record for one batch entry by its own id."""
+    token_id = _token_id(token)
+    if not isinstance(token_id, str) or not token_id:
         return None
-    keys = list(tokens.keys())
-    cursor = int(store.get("cursor", 0))
-    return tokens[keys[cursor % len(keys)]]
+    return (store.get("tokens") or {}).get(token_id)
 
 
 def link_batch(requests, store, now):
@@ -166,17 +236,21 @@ def link_batch(requests, store, now):
             continue
 
         token_id = record.get("id")
-        ok = (
-            not is_used(store, token_id)
-            and check_binding(record, device, subject)
-            and check_freshness(record, now, {})
-        )
+        if is_used(store, record):
+            reason = "already_used"
+        elif not check_binding(record, device, subject):
+            reason = "binding_mismatch"
+        elif not _valid_window(record, now, {}):
+            reason = "expired"
+        else:
+            reason = ""
+
         results.append(
             {
-                "ok": bool(ok),
+                "ok": reason == "",
                 "id": token_id,
-                "subject": record.get("subject"),
-                "reason": "" if ok else "invalid",
+                "subject": record.get("subject") if reason == "" else None,
+                "reason": reason,
             }
         )
 
