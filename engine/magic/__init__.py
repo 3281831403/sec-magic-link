@@ -1,0 +1,1 @@
+"""Magic-link issuance, binding, freshness, and batch validation."""
